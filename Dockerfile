@@ -1,40 +1,61 @@
-FROM openjdk:11-jdk
+# Image is reused in the workflow builds for master and the latest version
+FROM docker.io/maven:3.8.7-openjdk-18-slim AS build
+ARG DEBIAN_FRONTEND=noninteractive
 
-ENV MAVEN_OPTS="-Dmaven.repo.local=.m2/repository -Dorg.slf4j.simpleLogger.log.org.apache.maven.cli.transfer.Slf4jMavenTransferListener=WARN -Dorg.slf4j.simpleLogger.showDateTime=true -Djava.awt.headless=true"
-ENV MAVEN_CLI_OPTS="--batch-mode --errors --fail-at-end --show-version -DinstallAtEnd=true -DdeployAtEnd=true"
+# hadolint ignore=DL3002
+USER root
 
-ARG APP_CONFIG=./openrouteservice/src/main/resources/app.config.sample
-ARG OSM_FILE=./openrouteservice/src/main/files/heidelberg.osm.gz
-ARG BUILD_GRAPHS="False"
+WORKDIR /tmp/ors
 
-WORKDIR /ors-core
+COPY ors-api /tmp/ors/ors-api
+COPY ors-engine /tmp/ors/ors-engine
+COPY pom.xml /tmp/ors/pom.xml
+COPY ors-report-aggregation /tmp/ors/ors-report-aggregation
 
-COPY openrouteservice /ors-core/openrouteservice
-COPY $OSM_FILE /ors-core/data/osm_file.pbf
-COPY $APP_CONFIG /ors-core/openrouteservice/src/main/resources/app.config.sample
+# Build the project
+RUN mvn -q clean package -DskipTests
 
-# Install tomcat
-RUN wget -q https://archive.apache.org/dist/tomcat/tomcat-8/v8.5.39/bin/apache-tomcat-8.5.39.tar.gz -O /tmp/tomcat.tar.gz && \
-    cd /tmp && \
-    tar xvfz tomcat.tar.gz && \
-    mkdir /usr/local/tomcat /ors-conf && \
-    cp -R /tmp/apache-tomcat-8.5.39/* /usr/local/tomcat/ && \
-    # Install dependencies and locales
-    apt-get update -qq && apt-get install -qq -y locales nano maven moreutils jq && \
-    locale-gen en_US.UTF-8 && \
-    # Rename to app.config
-    cp /ors-core/openrouteservice/src/main/resources/app.config.sample /ors-core/openrouteservice/src/main/resources/app.config && \
-    # Replace paths in app.config to match docker setup
-    jq '.ors.services.routing.sources[0] = "data/osm_file.pbf"' /ors-core/openrouteservice/src/main/resources/app.config |sponge /ors-core/openrouteservice/src/main/resources/app.config && \
-    jq '.ors.services.routing.profiles.default_params.elevation_cache_path = "data/elevation_cache"' /ors-core/openrouteservice/src/main/resources/app.config |sponge /ors-core/openrouteservice/src/main/resources/app.config && \
-    jq '.ors.services.routing.profiles.default_params.graphs_root_path = "data/graphs"' /ors-core/openrouteservice/src/main/resources/app.config |sponge /ors-core/openrouteservice/src/main/resources/app.config && \
-    # init_threads = 1, > 1 been reported some issues
-    jq '.ors.services.routing.init_threads = 1' /ors-core/openrouteservice/src/main/resources/app.config |sponge /ors-core/openrouteservice/src/main/resources/app.config && \
-    # Delete all profiles but car
-    jq 'del(.ors.services.routing.profiles.active[1,2,3,4,5,6,7,8])' /ors-core/openrouteservice/src/main/resources/app.config |sponge /ors-core/openrouteservice/src/main/resources/app.config
+# Copy the example config files to the build folder
+COPY ./ors-config.yml /tmp/ors/example-ors-config.yml
+COPY ./ors-config.env /tmp/ors/example-ors-config.env
+# Rewrite the example config to use the right files in the container
+RUN sed -i "/ors.engine.source_file=.*/s/.*/ors.engine.source_file=\/home\/ors\/files\/example-heidelberg.osm.gz/" "/tmp/ors/example-ors-config.env" && \
+        sed -i "/    source_file:.*/s/.*/    source_file: \/home\/ors\/files\/example-heidelberg.osm.gz/" "/tmp/ors/example-ors-config.yml"
 
-COPY ./docker-entrypoint.sh /docker-entrypoint.sh
+# build final image, just copying stuff inside
+FROM docker.io/amazoncorretto:21.0.3-alpine3.19 AS publish
 
+# Build ARGS
+ARG UID=1000
+ARG GID=1000
+ARG OSM_FILE=./ors-api/src/test/files/heidelberg.osm.gz
+ARG ORS_HOME=/home/ors
+
+# Set the default language
+ENV LANG='en_US' LANGUAGE='en_US' LC_ALL='en_US'
+
+# Setup the target system with the right user and folders.
+RUN apk update && apk add --no-cache openssl bash yq jq  && \
+    addgroup ors -g ${GID} && \
+    mkdir -p ${ORS_HOME}/logs ${ORS_HOME}/files ${ORS_HOME}/graphs ${ORS_HOME}/elevation_cache  && \
+    adduser -D -h ${ORS_HOME} -u ${UID} --system -G ors ors  && \
+    chown ors:ors ${ORS_HOME} \
+    # Give all permissions to the user
+    && chmod -R 777 ${ORS_HOME}
+
+# Copy over the needed bits and pieces from the other stages.
+COPY --chown=ors:ors --from=build /tmp/ors/ors-api/target/ors.jar /ors.jar
+COPY --chown=ors:ors --from=build /tmp/ors/example-ors-config.yml /example-ors-config.yml
+COPY --chown=ors:ors --from=build /tmp/ors/example-ors-config.env /example-ors-config.env
+COPY --chown=ors:ors ./$OSM_FILE /heidelberg.osm.gz
+COPY --chown=ors:ors ./docker-entrypoint.sh /entrypoint.sh
+
+
+ENV BUILD_GRAPHS="False"
+ENV REBUILD_GRAPHS="False"
+# Set the ARG to an ENV. Else it will be lost.
+ENV ORS_HOME=${ORS_HOME}
+
+WORKDIR ${ORS_HOME}
 # Start the container
-EXPOSE 8080
-ENTRYPOINT ["/bin/bash", "/docker-entrypoint.sh"]
+ENTRYPOINT ["/entrypoint.sh"]
